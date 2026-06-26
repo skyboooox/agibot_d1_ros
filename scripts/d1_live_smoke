@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+CMD_TOPIC = "/agibot_d1/cmd_vel_safe"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Bounded ROS2 smoke for Agibot D1 HighLevel motion bridge.")
+    parser.add_argument("--self-test", action="store_true", help="Validate the script without ROS or hardware.")
+    parser.add_argument("--live", action="store_true", help="Use live SDK mode. Defaults to bridge dry-run.")
+    parser.add_argument("--allow-motion", action="store_true", help="Required with --live to set the live SDK gate.")
+    parser.add_argument("--command", choices=("forward", "rotate", "stop"), default="rotate")
+    parser.add_argument("--duration-s", type=float, default=2.0)
+    parser.add_argument("--rate-hz", type=float, default=20.0)
+    parser.add_argument("--vx", type=float, default=0.10)
+    parser.add_argument("--yaw-rate", type=float, default=0.10)
+    parser.add_argument("--local-ip", default=os.environ.get("AGIBOT_D1_LOCAL_IP", "192.168.168.100"))
+    parser.add_argument("--dog-ip", default=os.environ.get("AGIBOT_D1_ROBOT_IP", "192.168.168.168"))
+    parser.add_argument("--local-port", default=os.environ.get("AGIBOT_D1_LOCAL_PORT", "43988"))
+    parser.add_argument("--ready-timeout-s", type=float, default=20.0)
+    return parser.parse_args()
+
+
+def twist_for(args):
+    vx = args.vx if args.command == "forward" else 0.0
+    yaw = args.yaw_rate if args.command == "rotate" else 0.0
+    return (
+        "{linear: {x: %.6f, y: 0.0, z: 0.0}, "
+        "angular: {x: 0.0, y: 0.0, z: %.6f}}" % (vx, yaw)
+    )
+
+
+def start_process(command, env=None):
+    return subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        preexec_fn=os.setsid,
+    )
+
+
+def stop_process_group(process, name):
+    if process.poll() is not None:
+        return
+    for sig, wait_s in ((signal.SIGINT, 3.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, 1.0)):
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return
+            time.sleep(0.1)
+    raise RuntimeError(f"{name} did not stop")
+
+
+def read_output(process):
+    if process.stdout is None:
+        return ""
+    try:
+        return process.stdout.read() or ""
+    except ValueError:
+        return ""
+
+
+def wait_for_subscription(topic, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    last_output = ""
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["ros2", "topic", "info", topic],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        last_output = result.stdout
+        if "Subscription count: 1" in last_output:
+            return True, last_output
+        time.sleep(0.5)
+    return False, last_output
+
+
+def run_smoke(args):
+    if args.live and not args.allow_motion:
+        raise RuntimeError("--live requires --allow-motion")
+    if args.duration_s <= 0.0 or args.duration_s > 5.0:
+        raise RuntimeError("--duration-s must be in (0, 5]")
+    if args.rate_hz <= 0.0 or args.rate_hz > 50.0:
+        raise RuntimeError("--rate-hz must be in (0, 50]")
+    if args.live and args.command != "stop" and args.duration_s < 1.0:
+        raise RuntimeError("live non-zero motion requires --duration-s >= 1.0 for ROS discovery")
+
+    env = os.environ.copy()
+    if args.live:
+        env["AGIBOT_D1_ALLOW_LIVE_SDK"] = "1"
+
+    bridge_cmd = [
+        "ros2",
+        "run",
+        "agibot_d1_ros",
+        "d1_highlevel_bridge_node",
+        "--ros-args",
+        "-p",
+        f"dry_run:={'false' if args.live else 'true'}",
+        "-p",
+        f"allow_live_motion:={'true' if args.live else 'false'}",
+        "-p",
+        f"local_ip:={args.local_ip}",
+        "-p",
+        f"dog_ip:={args.dog_ip}",
+        "-p",
+        f"local_port:={args.local_port}",
+    ]
+    bridge = start_process(bridge_cmd, env=env)
+    publisher = None
+    try:
+        ready, topic_info = wait_for_subscription(CMD_TOPIC, args.ready_timeout_s)
+        print(topic_info.strip())
+        if not ready:
+            raise RuntimeError(f"{CMD_TOPIC} did not get a bridge subscription")
+        pub_cmd = [
+            "ros2",
+            "topic",
+            "pub",
+            "-r",
+            str(args.rate_hz),
+            CMD_TOPIC,
+            "geometry_msgs/msg/Twist",
+            twist_for(args),
+        ]
+        publisher = start_process(pub_cmd)
+        time.sleep(args.duration_s)
+        stop_process_group(publisher, "ros2 topic pub")
+        publisher_output = read_output(publisher)
+        print(publisher_output.strip())
+    finally:
+        if publisher is not None:
+            stop_process_group(publisher, "ros2 topic pub")
+        stop_process_group(bridge, "d1_highlevel_bridge_node")
+        bridge_output = read_output(bridge)
+        print(bridge_output.strip())
+
+    if args.live and "Agibot D1 live move accepted by SDK" not in bridge_output and args.command != "stop":
+        raise RuntimeError("live SDK did not confirm accepting a non-zero move")
+    return 0
+
+
+def main():
+    args = parse_args()
+    if args.self_test:
+        print("d1_live_smoke self-test ok")
+        print(twist_for(args))
+        return 0
+    return run_smoke(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
