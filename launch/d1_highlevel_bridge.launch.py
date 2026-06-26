@@ -9,6 +9,8 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("dry_run", default_value="true"),
             DeclareLaunchArgument("allow_live_motion", default_value="false"),
+            DeclareLaunchArgument("startup_standup", default_value="true"),
+            DeclareLaunchArgument("assume_standing_when_skip_standup", default_value="false"),
             DeclareLaunchArgument("local_ip", default_value="192.168.168.100"),
             DeclareLaunchArgument("dog_ip", default_value="192.168.168.168"),
             DeclareLaunchArgument("local_port", default_value="43988"),
@@ -29,6 +31,10 @@ def generate_launch_description():
                     {
                         "dry_run": LaunchConfiguration("dry_run"),
                         "allow_live_motion": LaunchConfiguration("allow_live_motion"),
+                        "startup_standup": LaunchConfiguration("startup_standup"),
+                        "assume_standing_when_skip_standup": LaunchConfiguration(
+                            "assume_standing_when_skip_standup"
+                        ),
                         "local_ip": LaunchConfiguration("local_ip"),
                         "dog_ip": LaunchConfiguration("dog_ip"),
                         "local_port": LaunchConfiguration("local_port"),

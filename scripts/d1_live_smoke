@@ -15,6 +15,16 @@ def parse_args():
     parser.add_argument("--self-test", action="store_true", help="Validate the script without ROS or hardware.")
     parser.add_argument("--live", action="store_true", help="Use live SDK mode. Defaults to bridge dry-run.")
     parser.add_argument("--allow-motion", action="store_true", help="Required with --live to set the live SDK gate.")
+    parser.add_argument(
+        "--skip-startup-standup",
+        action="store_true",
+        help="Do not call standUp() on bridge startup.",
+    )
+    parser.add_argument(
+        "--assume-standing",
+        action="store_true",
+        help="Skip standUp() and allow motion after operator visually confirms the D1 is standing.",
+    )
     parser.add_argument("--command", choices=("forward", "rotate", "stop"), default="rotate")
     parser.add_argument("--duration-s", type=float, default=2.0)
     parser.add_argument("--rate-hz", type=float, default=20.0)
@@ -99,6 +109,7 @@ def run_smoke(args):
         raise RuntimeError("--rate-hz must be in (0, 50]")
     if args.live and args.command != "stop" and args.duration_s < 1.0:
         raise RuntimeError("live non-zero motion requires --duration-s >= 1.0 for ROS discovery")
+    startup_standup = not args.skip_startup_standup and not args.assume_standing
 
     env = os.environ.copy()
     if args.live:
@@ -120,6 +131,10 @@ def run_smoke(args):
         f"dog_ip:={args.dog_ip}",
         "-p",
         f"local_port:={args.local_port}",
+        "-p",
+        f"startup_standup:={'true' if startup_standup else 'false'}",
+        "-p",
+        f"assume_standing_when_skip_standup:={'true' if args.assume_standing else 'false'}",
     ]
     bridge = start_process(bridge_cmd, env=env)
     publisher = None

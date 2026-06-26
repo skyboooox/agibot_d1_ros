@@ -15,6 +15,14 @@ using namespace std::chrono_literals;
 
 namespace agibot_d1_ros {
 
+constexpr uint32_t kDampingCtrlMode = 0;
+constexpr uint32_t kStandingCtrlMode = 1;
+constexpr uint32_t kMovingCtrlMode = 18;
+
+bool is_motion_ready_ctrl_mode(uint32_t ctrl_mode) {
+  return ctrl_mode == kStandingCtrlMode || ctrl_mode == kMovingCtrlMode;
+}
+
 class D1HighlevelBridgeNode final : public rclcpp::Node {
  public:
   D1HighlevelBridgeNode() : Node("agibot_d1_highlevel_bridge") {
@@ -22,6 +30,9 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     status_topic_ = declare_parameter<std::string>("status_topic", "/agibot_d1/bridge_status");
     dry_run_ = declare_parameter<bool>("dry_run", true);
     allow_live_motion_ = declare_parameter<bool>("allow_live_motion", false);
+    startup_standup_ = declare_parameter<bool>("startup_standup", true);
+    assume_standing_when_skip_standup_ =
+        declare_parameter<bool>("assume_standing_when_skip_standup", false);
     local_ip_ = declare_parameter<std::string>("local_ip", env_or("AGIBOT_D1_LOCAL_IP", "192.168.168.100"));
     dog_ip_ = declare_parameter<std::string>("dog_ip", env_or("AGIBOT_D1_ROBOT_IP", "192.168.168.168"));
     local_port_ = declare_parameter<int>("local_port", env_int_or("AGIBOT_D1_LOCAL_PORT", 43988));
@@ -38,17 +49,18 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     policy_.min_battery_percent_for_live_motion =
         declare_parameter<int>("min_battery_percent_for_live_motion", policy_.min_battery_percent_for_live_motion);
 
-    live_enabled_ = compute_live_enabled();
-    if (live_enabled_) {
-      init_sdk();
-      startup_sequence();
-    }
-
     status_publisher_ = create_publisher<std_msgs::msg::String>(status_topic_, 10);
     subscription_ = create_subscription<geometry_msgs::msg::Twist>(
         cmd_vel_topic_, 10, [this](const geometry_msgs::msg::Twist::SharedPtr msg) { on_twist(*msg); });
     sdk_stream_timer_ = create_wall_timer(50ms, [this]() { on_sdk_stream_tick(); });
-    publish_status("ready");
+
+    live_enabled_ = compute_live_enabled();
+    if (live_enabled_) {
+      publish_status("starting");
+      startup_timer_ = create_wall_timer(100ms, [this]() { start_live_control_session(); });
+    } else {
+      publish_status("ready");
+    }
     RCLCPP_INFO(get_logger(), "Agibot D1 zsl-1 bridge topic=%s dry_run=%s",
                 cmd_vel_topic_.c_str(), dry_run_ ? "true" : "false");
   }
@@ -89,6 +101,27 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     return true;
   }
 
+  void start_live_control_session() {
+    if (startup_started_) {
+      return;
+    }
+    startup_started_ = true;
+    if (startup_timer_) {
+      startup_timer_->cancel();
+    }
+    try {
+      publish_status("starting_sdk");
+      init_sdk();
+      publish_status("starting_standup");
+      startup_sequence();
+      publish_status("ready");
+    } catch (const std::exception &exc) {
+      publish_status(std::string("startup_error:") + exc.what());
+      RCLCPP_ERROR(get_logger(), "Agibot D1 live startup failed: %s", exc.what());
+      throw;
+    }
+  }
+
   void init_sdk() {
     sdk_ = std::make_unique<mc_sdk::zsl_1::HighLevel>();
     sdk_->initRobot(local_ip_, local_port_, dog_ip_);
@@ -108,19 +141,37 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     if (!sdk_) {
       return;
     }
-    sdk_->getCurrentCtrlmode();
+    const uint32_t initial_ctrl_mode = sdk_->getCurrentCtrlmode();
+    if (is_motion_ready_ctrl_mode(initial_ctrl_mode)) {
+      motion_ready_ = true;
+      RCLCPP_INFO(get_logger(), "Agibot D1 already motion-ready ctrl_mode=%u; skip standUp", initial_ctrl_mode);
+      return;
+    }
+    if (!startup_standup_) {
+      if (assume_standing_when_skip_standup_) {
+        motion_ready_ = true;
+        RCLCPP_WARN(get_logger(),
+                    "Agibot D1 startup_standup=false and assume_standing_when_skip_standup=true; "
+                    "skip standUp despite ctrl_mode=%u",
+                    initial_ctrl_mode);
+        return;
+      }
+      throw std::runtime_error(
+          "Agibot D1 is not reporting standing and startup_standup:=false; set startup_standup:=true "
+          "to call standUp automatically or assume_standing_when_skip_standup:=true after visual standing confirmation");
+    }
     const uint32_t ret = sdk_->standUp();
-    RCLCPP_INFO(get_logger(), "Agibot D1 standUp ret=%u wait_s=%.2f", ret, policy_.startup_stand_wait_s);
+    RCLCPP_INFO(get_logger(), "Agibot D1 standUp ret=%u from_ctrl_mode=%u wait_s=%.2f",
+                ret, initial_ctrl_mode, policy_.startup_stand_wait_s);
     if (ret != 0) {
       throw std::runtime_error("Agibot D1 standUp failed before live motion");
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(
+    wait_without_move_command(std::chrono::milliseconds(
         static_cast<int>(policy_.startup_stand_wait_s * 1000.0)));
     confirm_standing_after_standup();
   }
 
   void confirm_standing_after_standup() {
-    constexpr uint32_t kStandingCtrlMode = 1;
     const auto timeout = std::chrono::milliseconds(
         static_cast<int>(policy_.startup_stand_confirm_timeout_s * 1000.0));
     const auto poll = std::chrono::milliseconds(
@@ -130,17 +181,33 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
 
     while (std::chrono::steady_clock::now() <= deadline) {
       last_ctrl_mode = sdk_->getCurrentCtrlmode();
-      if (last_ctrl_mode == kStandingCtrlMode) {
+      if (is_motion_ready_ctrl_mode(last_ctrl_mode)) {
         motion_ready_ = true;
-        RCLCPP_INFO(get_logger(), "Agibot D1 standing confirmed ctrl_mode=%u", last_ctrl_mode);
+        RCLCPP_INFO(get_logger(), "Agibot D1 motion-ready confirmed ctrl_mode=%u", last_ctrl_mode);
         return;
       }
-      std::this_thread::sleep_for(poll);
+      wait_without_move_command(poll);
     }
 
     throw std::runtime_error(
-        "Agibot D1 standUp did not reach standing ctrl_mode=1; last_ctrl_mode=" +
+        "Agibot D1 standUp did not reach motion-ready ctrl_mode=1 or 18; last_ctrl_mode=" +
         std::to_string(last_ctrl_mode));
+  }
+
+  std::chrono::milliseconds sdk_frame_period() const {
+    return std::chrono::milliseconds(
+        std::max(1, static_cast<int>(1000.0 / policy_.publish_rate_hz)));
+  }
+
+  void wait_without_move_command(std::chrono::milliseconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    const auto period = std::chrono::milliseconds(
+        std::max(1, static_cast<int>(policy_.startup_stand_confirm_poll_s * 1000.0)));
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+      std::this_thread::sleep_for(std::min(period, std::max(1ms, remaining)));
+    }
   }
 
   void on_twist(const geometry_msgs::msg::Twist &msg) {
@@ -219,7 +286,10 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
   BridgePolicy policy_{};
   bool dry_run_{true};
   bool allow_live_motion_{false};
+  bool startup_standup_{true};
+  bool assume_standing_when_skip_standup_{false};
   bool live_enabled_{false};
+  bool startup_started_{false};
   bool motion_ready_{false};
   bool first_live_move_logged_{false};
   int local_port_{43988};
@@ -233,6 +303,7 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr subscription_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
   rclcpp::TimerBase::SharedPtr sdk_stream_timer_;
+  rclcpp::TimerBase::SharedPtr startup_timer_;
 };
 
 }  // namespace agibot_d1_ros

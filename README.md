@@ -16,7 +16,7 @@ topics, request formats, low-level examples, or CycloneDDS assumptions.
 
 - Subscribe to a guarded `geometry_msgs/msg/Twist` topic.
 - Normalize bounded velocity commands to `HighLevel.move(vx, vy, yaw_rate)`.
-- Run `standUp()` before live motion, require SDK standing-state confirmation,
+- Run `standUp()` automatically before live motion, require SDK standing-state confirmation,
   then stream `move()` at 20 Hz.
 - Publish read-only SDK state as JSON on `/agibot_d1/state`.
 - Fail closed by default: dry-run mode is enabled unless explicitly disabled.
@@ -104,6 +104,14 @@ Read-only state dry-run:
 ros2 run agibot_d1_ros d1_state_node --ros-args -p dry_run:=true
 ```
 
+Do not use `d1_state_node` live on a standing robot for routine status checks.
+The official SDK treats an SDK connection as the active control source; if that
+read-only process does not keep sending control frames, the robot-side watchdog
+can switch the D1 into damping/lie-down. Use robot-owned ROS/eCAL state topics
+for passive status. Live SDK state reads require both
+`allow_watchdog_damping_risk:=true` and
+`AGIBOT_D1_ALLOW_WATCHDOG_DAMPING_RISK=1`.
+
 State launch:
 
 ```bash
@@ -118,10 +126,19 @@ ros2 run agibot_d1_ros d1_highlevel_bridge_node \
   --ros-args \
   -p dry_run:=false \
   -p allow_live_motion:=true \
+  -p startup_standup:=true \
   -p local_ip:=192.168.168.100 \
   -p dog_ip:=192.168.168.168 \
   -p local_port:=43988
 ```
+
+`startup_standup` defaults to `true`: live bridge startup automatically calls
+`standUp()` when the SDK does not already report standing. If
+`getCurrentCtrlmode()` already reports `ctrl_mode=1`, the bridge skips
+`standUp()` to avoid repeating a stance transition. Only set
+`startup_standup:=false` for expert debugging; if the robot is visually
+standing but `getCurrentCtrlmode()` is stale or reports a non-standing mode,
+also set `assume_standing_when_skip_standup:=true` after manual confirmation.
 
 Bounded live smoke through ROS topic publishing:
 
@@ -133,6 +150,18 @@ ros2 run agibot_d1_ros d1_live_smoke \
 `d1_live_smoke` starts the bridge, waits for a subscription on
 `/agibot_d1/cmd_vel_safe`, publishes a bounded `Twist`, and stops the process
 group on exit.
+It uses automatic startup `standUp()` by default. Use
+`--assume-standing` only when the operator has visually confirmed the D1 is
+already standing and explicitly wants to skip `standUp()`.
+
+`initRobot()` is called only by the live motion bridge after ROS publishers,
+subscriptions, and SDK stream timers are created and the executor has started.
+It is not used for routine status checks. After `initRobot()` succeeds, the
+startup sequence either confirms the SDK already reports standing or calls
+`standUp()` and waits for SDK `ctrl_mode=1` or `ctrl_mode=18` before any
+`move()` command is allowed. The bridge does not call `move()` during the
+standing transition because the official SDK documents `move()` as valid only
+from the standing state.
 
 Default command topic:
 
@@ -163,9 +192,9 @@ Inputs below the official non-zero minimum are normalized to zero. Inputs above
 the configured safe limit are blocked and converted to a stop command.
 
 `standUp()` returning success is not treated as proof that motion is safe. In
-live mode, the bridge must also observe SDK `ctrl_mode=1` before any
-`HighLevel.move()` command is sent. If the SDK never reports the standing mode,
-the node exits fail-closed instead of streaming movement.
+live mode, the bridge must also observe SDK `ctrl_mode=1` or `ctrl_mode=18`
+before any `HighLevel.move()` command is sent. If the SDK never reports a
+motion-ready mode, the node exits fail-closed instead of streaming movement.
 
 ## License
 

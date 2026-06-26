@@ -18,6 +18,7 @@ class D1StateNode final : public rclcpp::Node {
     state_topic_ = declare_parameter<std::string>("state_topic", "/agibot_d1/state");
     dry_run_ = declare_parameter<bool>("dry_run", true);
     allow_sdk_connect_ = declare_parameter<bool>("allow_sdk_connect", false);
+    allow_watchdog_damping_risk_ = declare_parameter<bool>("allow_watchdog_damping_risk", false);
     local_ip_ = declare_parameter<std::string>("local_ip", env_or("AGIBOT_D1_LOCAL_IP", "192.168.168.100"));
     dog_ip_ = declare_parameter<std::string>("dog_ip", env_or("AGIBOT_D1_ROBOT_IP", "192.168.168.168"));
     local_port_ = declare_parameter<int>("local_port", env_int_or("AGIBOT_D1_LOCAL_PORT", 43988));
@@ -60,6 +61,13 @@ class D1StateNode final : public rclcpp::Node {
     const char *gate = std::getenv("AGIBOT_D1_ALLOW_READONLY_SDK");
     if (gate == nullptr || std::string(gate) != "1") {
       throw std::runtime_error("read-only SDK connect requires AGIBOT_D1_ALLOW_READONLY_SDK=1");
+    }
+    const char *risk_gate = std::getenv("AGIBOT_D1_ALLOW_WATCHDOG_DAMPING_RISK");
+    if (!allow_watchdog_damping_risk_ || risk_gate == nullptr || std::string(risk_gate) != "1") {
+      throw std::runtime_error(
+          "read-only SDK connect can seize SDK control and trigger watchdog damping; "
+          "use robot ROS/eCAL state topics instead, or explicitly set "
+          "allow_watchdog_damping_risk:=true and AGIBOT_D1_ALLOW_WATCHDOG_DAMPING_RISK=1");
     }
     return true;
   }
@@ -107,6 +115,7 @@ class D1StateNode final : public rclcpp::Node {
 
   bool dry_run_{true};
   bool allow_sdk_connect_{false};
+  bool allow_watchdog_damping_risk_{false};
   int local_port_{43988};
   std::string local_ip_;
   std::string dog_ip_;

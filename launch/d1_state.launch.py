@@ -9,6 +9,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("dry_run", default_value="true"),
             DeclareLaunchArgument("allow_sdk_connect", default_value="false"),
+            DeclareLaunchArgument("allow_watchdog_damping_risk", default_value="false"),
             DeclareLaunchArgument("local_ip", default_value="192.168.168.100"),
             DeclareLaunchArgument("dog_ip", default_value="192.168.168.168"),
             DeclareLaunchArgument("local_port", default_value="43988"),
@@ -22,6 +23,7 @@ def generate_launch_description():
                     {
                         "dry_run": LaunchConfiguration("dry_run"),
                         "allow_sdk_connect": LaunchConfiguration("allow_sdk_connect"),
+                        "allow_watchdog_damping_risk": LaunchConfiguration("allow_watchdog_damping_risk"),
                         "local_ip": LaunchConfiguration("local_ip"),
                         "dog_ip": LaunchConfiguration("dog_ip"),
                         "local_port": LaunchConfiguration("local_port"),
