@@ -35,7 +35,7 @@ struct BridgePolicy {
   double publish_rate_hz{20.0};
   double watchdog_timeout_s{0.5};
   double stop_hold_s{0.5};
-  double startup_stand_wait_s{4.0};
+  double startup_stand_wait_s{5.0};
   double startup_stand_confirm_timeout_s{8.0};
   double startup_stand_confirm_poll_s{0.5};
   int min_battery_percent_for_live_motion{20};

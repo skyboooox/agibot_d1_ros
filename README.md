@@ -136,9 +136,10 @@ ros2 run agibot_d1_ros d1_highlevel_bridge_node \
 `standUp()` when the SDK does not already report standing. If
 `getCurrentCtrlmode()` already reports `ctrl_mode=1`, the bridge skips
 `standUp()` to avoid repeating a stance transition. Only set
-`startup_standup:=false` for expert debugging; if the robot is visually
-standing but `getCurrentCtrlmode()` is stale or reports a non-standing mode,
-also set `assume_standing_when_skip_standup:=true` after manual confirmation.
+`startup_standup:=false` for expert debugging; live startup no longer permits
+`assume_standing_when_skip_standup` to bypass a non-standing SDK state. When
+`standUp()` is required, the bridge waits at least 5 seconds before calling it,
+then waits at least 5 seconds after the call before confirming `ctrl_mode=1`.
 
 Bounded live smoke through ROS topic publishing:
 
@@ -151,17 +152,17 @@ ros2 run agibot_d1_ros d1_live_smoke \
 `/agibot_d1/cmd_vel_safe`, publishes a bounded `Twist`, and stops the process
 group on exit.
 It uses automatic startup `standUp()` by default. Use
-`--assume-standing` only when the operator has visually confirmed the D1 is
-already standing and explicitly wants to skip `standUp()`.
+`--assume-standing` only for dry-run or non-live diagnostics; live startup
+standUp cannot be skipped when the SDK does not report standing.
 
 `initRobot()` is called only by the live motion bridge after ROS publishers,
 subscriptions, and SDK stream timers are created and the executor has started.
 It is not used for routine status checks. After `initRobot()` succeeds, the
 startup sequence either confirms the SDK already reports standing or calls
-`standUp()` and waits for SDK `ctrl_mode=1` or `ctrl_mode=18` before any
-`move()` command is allowed. The bridge does not call `move()` during the
-standing transition because the official SDK documents `move()` as valid only
-from the standing state.
+`standUp()` after a mandatory 5 second pre-wait and then waits for SDK
+`ctrl_mode=1` before any `move()` command is allowed. The bridge does not call
+`move()` during the standing transition because the official SDK documents
+`move()` as valid only from the standing state.
 
 Default command topic:
 
@@ -192,9 +193,9 @@ Inputs below the official non-zero minimum are normalized to zero. Inputs above
 the configured safe limit are blocked and converted to a stop command.
 
 `standUp()` returning success is not treated as proof that motion is safe. In
-live mode, the bridge must also observe SDK `ctrl_mode=1` or `ctrl_mode=18`
-before any `HighLevel.move()` command is sent. If the SDK never reports a
-motion-ready mode, the node exits fail-closed instead of streaming movement.
+live mode, the bridge must also observe SDK standing `ctrl_mode=1` before any
+`HighLevel.move()` command is sent. If the SDK never reports standing, the node
+exits fail-closed instead of streaming movement.
 
 ## License
 

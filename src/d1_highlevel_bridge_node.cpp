@@ -18,9 +18,10 @@ namespace agibot_d1_ros {
 constexpr uint32_t kDampingCtrlMode = 0;
 constexpr uint32_t kStandingCtrlMode = 1;
 constexpr uint32_t kMovingCtrlMode = 18;
+constexpr double kMinimumStartupStandWaitS = 5.0;
 
-bool is_motion_ready_ctrl_mode(uint32_t ctrl_mode) {
-  return ctrl_mode == kStandingCtrlMode || ctrl_mode == kMovingCtrlMode;
+bool is_standing_ctrl_mode(uint32_t ctrl_mode) {
+  return ctrl_mode == kStandingCtrlMode;
 }
 
 class D1HighlevelBridgeNode final : public rclcpp::Node {
@@ -42,6 +43,7 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     policy_.watchdog_timeout_s = declare_parameter<double>("watchdog_timeout_s", policy_.watchdog_timeout_s);
     policy_.stop_hold_s = declare_parameter<double>("stop_hold_s", policy_.stop_hold_s);
     policy_.startup_stand_wait_s = declare_parameter<double>("startup_stand_wait_s", policy_.startup_stand_wait_s);
+    policy_.startup_stand_wait_s = std::max(policy_.startup_stand_wait_s, kMinimumStartupStandWaitS);
     policy_.startup_stand_confirm_timeout_s =
         declare_parameter<double>("startup_stand_confirm_timeout_s", policy_.startup_stand_confirm_timeout_s);
     policy_.startup_stand_confirm_poll_s =
@@ -142,26 +144,31 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
       return;
     }
     const uint32_t initial_ctrl_mode = sdk_->getCurrentCtrlmode();
-    if (is_motion_ready_ctrl_mode(initial_ctrl_mode)) {
+    if (is_standing_ctrl_mode(initial_ctrl_mode)) {
       motion_ready_ = true;
-      RCLCPP_INFO(get_logger(), "Agibot D1 already motion-ready ctrl_mode=%u; skip standUp", initial_ctrl_mode);
+      RCLCPP_INFO(get_logger(), "Agibot D1 already standing ctrl_mode=%u; skip standUp", initial_ctrl_mode);
       return;
     }
-    if (!startup_standup_) {
-      if (assume_standing_when_skip_standup_) {
+    if (initial_ctrl_mode == kMovingCtrlMode) {
+      wait_without_move_command(std::chrono::milliseconds(
+          static_cast<int>(policy_.startup_stand_confirm_poll_s * 1000.0)));
+      const uint32_t settled_ctrl_mode = sdk_->getCurrentCtrlmode();
+      if (is_standing_ctrl_mode(settled_ctrl_mode)) {
         motion_ready_ = true;
-        RCLCPP_WARN(get_logger(),
-                    "Agibot D1 startup_standup=false and assume_standing_when_skip_standup=true; "
-                    "skip standUp despite ctrl_mode=%u",
-                    initial_ctrl_mode);
+        RCLCPP_INFO(get_logger(), "Agibot D1 returned to standing ctrl_mode=%u; skip standUp", settled_ctrl_mode);
         return;
       }
       throw std::runtime_error(
-          "Agibot D1 is not reporting standing and startup_standup:=false; set startup_standup:=true "
-          "to call standUp automatically or assume_standing_when_skip_standup:=true after visual standing confirmation");
+          "Agibot D1 reports moving ctrl_mode=18 at startup; refusing automatic standUp from moving state");
     }
+    if (!startup_standup_) {
+      throw std::runtime_error(
+          "Agibot D1 is not reporting standing and startup_standup:=false; set startup_standup:=true "
+          "to call standUp automatically after the mandatory pre-stand wait");
+    }
+    wait_before_standup(initial_ctrl_mode);
     const uint32_t ret = sdk_->standUp();
-    RCLCPP_INFO(get_logger(), "Agibot D1 standUp ret=%u from_ctrl_mode=%u wait_s=%.2f",
+    RCLCPP_INFO(get_logger(), "Agibot D1 standUp ret=%u from_ctrl_mode=%u post_wait_s=%.2f",
                 ret, initial_ctrl_mode, policy_.startup_stand_wait_s);
     if (ret != 0) {
       throw std::runtime_error("Agibot D1 standUp failed before live motion");
@@ -169,6 +176,13 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     wait_without_move_command(std::chrono::milliseconds(
         static_cast<int>(policy_.startup_stand_wait_s * 1000.0)));
     confirm_standing_after_standup();
+  }
+
+  void wait_before_standup(uint32_t ctrl_mode) {
+    RCLCPP_INFO(get_logger(), "Agibot D1 pre-stand wait_s=%.2f from_ctrl_mode=%u",
+                policy_.startup_stand_wait_s, ctrl_mode);
+    wait_without_move_command(std::chrono::milliseconds(
+        static_cast<int>(policy_.startup_stand_wait_s * 1000.0)));
   }
 
   void confirm_standing_after_standup() {
@@ -181,16 +195,16 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
 
     while (std::chrono::steady_clock::now() <= deadline) {
       last_ctrl_mode = sdk_->getCurrentCtrlmode();
-      if (is_motion_ready_ctrl_mode(last_ctrl_mode)) {
+      if (is_standing_ctrl_mode(last_ctrl_mode)) {
         motion_ready_ = true;
-        RCLCPP_INFO(get_logger(), "Agibot D1 motion-ready confirmed ctrl_mode=%u", last_ctrl_mode);
+        RCLCPP_INFO(get_logger(), "Agibot D1 standing confirmed ctrl_mode=%u", last_ctrl_mode);
         return;
       }
       wait_without_move_command(poll);
     }
 
     throw std::runtime_error(
-        "Agibot D1 standUp did not reach motion-ready ctrl_mode=1 or 18; last_ctrl_mode=" +
+        "Agibot D1 standUp did not reach standing ctrl_mode=1; last_ctrl_mode=" +
         std::to_string(last_ctrl_mode));
   }
 
@@ -211,6 +225,11 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
   }
 
   void on_twist(const geometry_msgs::msg::Twist &msg) {
+    if (sdk_move_fault_) {
+      current_command_ = stop_command();
+      publish_status("sdk_move_fault_blocked");
+      return;
+    }
     const CommandDecision decision = normalize_twist(policy_, msg.linear.x, msg.linear.y, msg.angular.z);
     if (!decision.allowed) {
       RCLCPP_WARN(get_logger(), "%s", decision.reason.c_str());
@@ -223,8 +242,12 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     last_command_time_ = now();
     current_command_ = decision.command;
     publish_status("accepted");
-    RCLCPP_INFO(get_logger(), "accepted vx=%.3f vy=%.3f yaw=%.3f",
-                current_command_.vx_mps, current_command_.vy_mps, current_command_.yaw_rate_radps);
+    const bool nonzero =
+        current_command_.vx_mps != 0.0 || current_command_.vy_mps != 0.0 || current_command_.yaw_rate_radps != 0.0;
+    if (nonzero) {
+      RCLCPP_INFO(get_logger(), "accepted vx=%.3f vy=%.3f yaw=%.3f",
+                  current_command_.vx_mps, current_command_.vy_mps, current_command_.yaw_rate_radps);
+    }
   }
 
   void on_sdk_stream_tick() {
@@ -243,17 +266,29 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
     if (!motion_ready_) {
       return;
     }
+    const bool nonzero = command.vx_mps != 0.0 || command.vy_mps != 0.0 || command.yaw_rate_radps != 0.0;
+    if (sdk_move_fault_ && nonzero) {
+      return;
+    }
     const uint32_t ret = sdk_->move(
         static_cast<float>(command.vx_mps),
         static_cast<float>(command.vy_mps),
         static_cast<float>(command.yaw_rate_radps));
     if (ret != 0) {
-      RCLCPP_WARN(get_logger(), "Agibot D1 move ret=%u vx=%.3f vy=%.3f yaw=%.3f",
-                  ret, command.vx_mps, command.vy_mps, command.yaw_rate_radps);
+      if (nonzero) {
+        sdk_move_fault_ = true;
+        current_command_ = stop_command();
+      }
+      if (nonzero || !zero_move_error_logged_) {
+        RCLCPP_WARN(get_logger(), "Agibot D1 move ret=%u vx=%.3f vy=%.3f yaw=%.3f",
+                    ret, command.vx_mps, command.vy_mps, command.yaw_rate_radps);
+      }
+      if (!nonzero) {
+        zero_move_error_logged_ = true;
+      }
       publish_status("sdk_move_error:" + std::to_string(ret));
       return;
     }
-    const bool nonzero = command.vx_mps != 0.0 || command.vy_mps != 0.0 || command.yaw_rate_radps != 0.0;
     if (nonzero && !first_live_move_logged_) {
       first_live_move_logged_ = true;
       RCLCPP_INFO(get_logger(), "Agibot D1 live move accepted by SDK vx=%.3f vy=%.3f yaw=%.3f",
@@ -292,6 +327,8 @@ class D1HighlevelBridgeNode final : public rclcpp::Node {
   bool startup_started_{false};
   bool motion_ready_{false};
   bool first_live_move_logged_{false};
+  bool sdk_move_fault_{false};
+  bool zero_move_error_logged_{false};
   int local_port_{43988};
   std::string local_ip_;
   std::string dog_ip_;

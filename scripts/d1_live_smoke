@@ -109,6 +109,8 @@ def run_smoke(args):
         raise RuntimeError("--rate-hz must be in (0, 50]")
     if args.live and args.command != "stop" and args.duration_s < 1.0:
         raise RuntimeError("live non-zero motion requires --duration-s >= 1.0 for ROS discovery")
+    if args.live and (args.skip_startup_standup or args.assume_standing):
+        raise RuntimeError("live startup standUp cannot be skipped")
     startup_standup = not args.skip_startup_standup and not args.assume_standing
 
     env = os.environ.copy()

@@ -20,7 +20,7 @@ def generate_launch_description():
             DeclareLaunchArgument("safe_max_vy_mps", default_value="0.12"),
             DeclareLaunchArgument("safe_max_yaw_rate_radps", default_value="0.20"),
             DeclareLaunchArgument("watchdog_timeout_s", default_value="0.5"),
-            DeclareLaunchArgument("startup_stand_wait_s", default_value="4.0"),
+            DeclareLaunchArgument("startup_stand_wait_s", default_value="5.0"),
             DeclareLaunchArgument("startup_stand_confirm_timeout_s", default_value="8.0"),
             Node(
                 package="agibot_d1_ros",
